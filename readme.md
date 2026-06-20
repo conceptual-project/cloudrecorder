@@ -378,6 +378,11 @@ Example log entries:
 - Active `arecord`/`ffmpeg` subprocesses receive `SIGTERM`.
 - The current upload cycle is awaited with a 10-second timeout.
 - All waits (`time.sleep`) are replaced with interruptible `shutdown_event.wait()`, ensuring a fast and clean exit.
+- If a thread does not finish within the timeout, a warning is logged (the process exits anyway, since all worker threads are daemons).
+
+### Local-only mode (`cloud.service = "none"`)
+
+When `cloud.service = "none"`, files are **not** uploaded anywhere and stay in `output_dir`. To distinguish already-processed files from unfinished recordings on restart, processed files get a `.done` suffix appended to their extension (e.g. `rec_20240101_120000.mp3.done`). `recover_interrupted_files()` skips such files, preventing an infinite reprocessing loop.
 
 ---
 
