@@ -405,7 +405,7 @@ cloudrecorder/
 ├── cloudrecorder.py        # Главный скрипт (~890 строк, единый файл)
 ├── config.json             # Конфигурация по умолчанию
 ├── cloudrecorder.service   # systemd unit-файл
-└── readme.html             # Инструкция по сборке и развёртыванию бинарника
+└── readme.md               # Инструкция по сборке и развёртыванию бинарника
 ```
 
 ---
