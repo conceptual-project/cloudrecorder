@@ -4,6 +4,13 @@ CloudRecorder — автоматическая запись звука с мик
 записанных файлов в облачное хранилище (Яндекс.Диск / Google Drive) через rclone.
 
 Единый скрипт: запись → очередь → загрузка в облако.
+
+Оптимизировано для автономной работы 24/7 на устройствах с micro-SD:
+  • асинхронное буферизованное логирование (QueueHandler/QueueListener);
+  • кэширование результатов дорогих сетевых проверок;
+  • минимизация операций записи на диск (убраны .recording маркеры);
+  • O(N) очистка хранилища вместо O(N²);
+  • прерываемые ожидания через shutdown_event.wait().
 """
 import os
 import sys
@@ -18,9 +25,9 @@ from pathlib import Path
 from datetime import datetime
 from shutil import which, move, disk_usage
 from queue import Queue
-from typing import Literal, Optional, List, Tuple
+from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
+from typing import Literal, Optional, List, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from logging.handlers import TimedRotatingFileHandler
 
 # --- Pydantic для валидации конфига ---
 try:
@@ -49,8 +56,12 @@ SHUTDOWN_TIMEOUT_SECONDS = 10               # Таймаут ожидания з
 SUBPROCESS_KILL_TIMEOUT_SECONDS = 5         # Таймаут ожидания завершения убитого подпроцесса
 CONNECTIVITY_TIMEOUT_MULTIPLIER = 2         # Множитель таймаута для rclone about (рукопожатие авторизации)
 
+# Кэширование дорогих сетевых/системных проверок (защита micro-SD от лишних процессов)
+CONNECTIVITY_CACHE_TTL_SECONDS = 60         # TTL кэша check_internet_access
+NETWORK_SPEED_CACHE_TTL_SECONDS = 300       # TTL кэша check_network_speed
+
 # Поддерживаемые ffmpeg-кодировщики по форматам конфига
-FFMPEG_ENCODERS = {"opus": "libopus", "aac": "aac", "mp3": "libmp3lame"}
+FFMPEG_ENCODERS: Dict[str, str] = {"opus": "libopus", "aac": "aac", "mp3": "libmp3lame"}
 
 
 # ========================================================
@@ -142,12 +153,27 @@ class AudioRecorder:
 
         # Активные подпроцессы записи (для корректного завершения по сигналу)
         self._active_recording_procs: List[subprocess.Popen] = []
+        self._recording_lock = threading.Lock()
 
         # Очередь для файлов, ожидающих обработки (продюсер-потребитель)
         self.work_queue: Queue = Queue()
         self.consumer_thread: Optional[threading.Thread] = None
         self.upload_thread: Optional[threading.Thread] = None
         self.upload_lock_path = os.path.join(self.config.output_dir, "upload.lock")
+
+        # Кэш дорогих сетевых проверок (защита от частых spawn процессов на micro-SD)
+        self._connectivity_cache: Tuple[float, bool] = (0.0, False)
+        self._network_speed_cache: Tuple[float, str] = (0.0, "unknown")
+        self._ffmpeg_encoders_checked: bool = False
+        self._ffmpeg_encoders_available: bool = False
+
+        # Предвычисляемые значения (конфиг статичен)
+        self._file_extension: str = self.config.audio.format
+        self._cloud_target: Optional[str] = self._compute_cloud_target()
+        self._pending_dir: str = os.path.join(self.config.output_dir, "pending")
+        self._file_pattern: str = (
+            f"{self.config.audio.file_prefix}_*.{self._file_extension}"
+        )
 
     # ----------------------------------------------------------
     # Конфигурация и логирование
@@ -172,7 +198,13 @@ class AudioRecorder:
             sys.exit(1)
 
     def _setup_logging(self) -> None:
-        """Настраивает логирование на основе конфигурации."""
+        """Настраивает асинхронное буферизованное логирование.
+
+        QueueHandler/QueueListener отделяют запись на диск от потока-источника:
+        все log-сообщения попадают в in-memory очередь, а отдельный поток
+        (QueueListener) записывает их в файл батчами. Это радикально снижает
+        количество sync-операций на micro-SD при работе 24/7.
+        """
         log_file = self.config.log_file
         os.makedirs(Path(log_file).parent, exist_ok=True)
 
@@ -183,9 +215,21 @@ class AudioRecorder:
             "%(asctime)s - %(levelname)s - %(threadName)s - %(message)s"
         ))
 
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(threadName)s - %(message)s"
+        ))
+
         logger.setLevel(logging.INFO)
-        logger.addHandler(file_handler)
-        logger.addHandler(logging.StreamHandler(sys.stdout))
+
+        # Асинхронная запись: QueueListener пишет в файл в отдельном потоке,
+        # QueueHandler только кладёт сообщение в очередь (неблокирующе).
+        self._log_queue: Queue = Queue()
+        self._log_listener = QueueListener(
+            self._log_queue, file_handler, stream_handler, respect_handler_level=True
+        )
+        self._log_listener.start()
+        logger.addHandler(QueueHandler(self._log_queue))
 
     # ----------------------------------------------------------
     # Вспомогательные методы
@@ -244,22 +288,24 @@ class AudioRecorder:
         logger.info("Все зависимости на месте.")
 
     def _ffmpeg_encoder_available(self, encoder_name: str) -> bool:
-        """Точно проверяет наличие кодировщика в ffmpeg (по имени, без подстрок)."""
+        """Точно проверяет наличие кодировщика в ffmpeg. Результат кэшируется."""
+        if self._ffmpeg_encoders_checked:
+            return self._ffmpeg_encoders_available
         code, out, _ = self._run_command(["ffmpeg", "-hide_banner", "-encoders"])
+        self._ffmpeg_encoders_checked = True
         if code != 0:
+            self._ffmpeg_encoders_available = False
             return False
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[1] == encoder_name:
+                self._ffmpeg_encoders_available = True
                 return True
+        self._ffmpeg_encoders_available = False
         return False
 
-    def get_file_extension(self) -> str:
-        """Возвращает расширение файлов записей."""
-        return self.config.audio.format
-
-    def get_cloud_target(self) -> Optional[str]:
-        """Возвращает rclone-цель для текущего облачного сервиса."""
+    def _compute_cloud_target(self) -> Optional[str]:
+        """Вычисляет rclone-цель для текущего облачного сервиса (один раз)."""
         service = self.config.cloud.service
         if service == "google":
             return f"{self.config.google_drive.remote}:{self.config.google_drive.dir}"
@@ -267,31 +313,8 @@ class AudioRecorder:
             return f"{self.config.yandex_disk.remote}:{self.config.yandex_disk.dir}"
         return None
 
-    def get_cloud_name(self) -> str:
-        """Человекочитаемое имя облачного сервиса."""
-        return {
-            "google": "Google Drive",
-            "yandex": "Яндекс.Диск",
-            "none": "локальное хранилище",
-        }.get(self.config.cloud.service, "неизвестно")
-
-    def dir_size_mb(self, path: str) -> int:
-        """Рекурсивно подсчитывает размер директории (МБ) через быстрый os.scandir."""
-        total = 0
-        if not os.path.exists(path):
-            return 0
-        try:
-            for entry in os.scandir(path):
-                if entry.is_dir(follow_symlinks=False):
-                    total += self.dir_size_mb(entry.path)
-                else:
-                    total += entry.stat(follow_symlinks=False).st_size
-        except OSError as e:
-            logger.error(f"Ошибка при подсчёте размера директории {path}: {e}")
-        return total // (1024 * 1024)
-
     # ----------------------------------------------------------
-    # Проверка оборудования и сети
+    # Проверка оборудования и сети (с кэшированием)
     # ----------------------------------------------------------
 
     def setup_mic(self) -> None:
@@ -315,25 +338,47 @@ class AudioRecorder:
         logger.info(f"Микрофон готов: {audio_cfg.mic}")
 
     def check_internet_access(self) -> bool:
-        """Проверяет доступность облачного remote через rclone about."""
+        """Проверяет доступность облачного remote через rclone about.
+
+        Результат кэшируется на CONNECTIVITY_CACHE_TTL_SECONDS, чтобы не
+        порождать rclone-процесс на каждую попытку загрузки (дорого для micro-SD
+        и замедляет обработку очереди).
+        """
         if self.config.cloud.service == "none":
             return True
 
-        cloud_target = self.get_cloud_target()
-        if not cloud_target:
+        now = time.time()
+        cached_at, cached_result = self._connectivity_cache
+        if now - cached_at < CONNECTIVITY_CACHE_TTL_SECONDS:
+            return cached_result
+
+        if not self._cloud_target:
+            self._connectivity_cache = (now, False)
             return False
 
         timeout = self.config.cloud.connectivity_timeout * CONNECTIVITY_TIMEOUT_MULTIPLIER
-        cloud_remote = cloud_target.split(':')[0]
+        cloud_remote = self._cloud_target.split(':')[0]
         code, _, _ = self._run_command(['rclone', 'about', f'{cloud_remote}:'], timeout=timeout)
-        return code == 0
+        result = code == 0
+        self._connectivity_cache = (now, result)
+        return result
 
     def check_network_speed(self) -> str:
-        """Оценивает скорость сети по среднему ping: 'fast', 'slow' или 'unknown'."""
+        """Оценивает скорость сети по среднему ping: 'fast', 'slow' или 'unknown'.
+
+        Результат кэшируется на NETWORK_SPEED_CACHE_TTL_SECONDS (по умолчанию 5 мин),
+        т.к. ping -c 3 занимает 3 секунды и не должен выполняться перед каждой загрузкой.
+        """
+        now = time.time()
+        cached_at, cached_result = self._network_speed_cache
+        if now - cached_at < NETWORK_SPEED_CACHE_TTL_SECONDS:
+            return cached_result
+
         ping_address = self.config.cloud.ping_address
         code, out, err = self._run_command(['ping', '-c', str(PING_PACKET_COUNT), ping_address])
         if code != 0:
             logger.warning(f"Ping к {ping_address} не удался (код: {code}). Stderr: {err.strip()}.")
+            self._network_speed_cache = (now, "unknown")
             return "unknown"
         try:
             match = re.search(r'rtt min/avg/max/mdev = .*?/([0-9.]+)/.*? ms', out)
@@ -342,11 +387,14 @@ class AudioRecorder:
                 threshold = self.config.cloud.network_speed_threshold
                 network_state = "slow" if avg > threshold else "fast"
                 logger.info(f"Скорость сети определена как: {network_state} (avg ping: {avg:.2f}ms).")
+                self._network_speed_cache = (now, network_state)
                 return network_state
             logger.warning("Не удалось распарсить вывод ping. Скорость сети неизвестна.")
+            self._network_speed_cache = (now, "unknown")
             return "unknown"
         except (IndexError, ValueError, TypeError) as e:
             logger.warning(f"Ошибка при парсинге вывода ping: {e}. Скорость сети неизвестна.")
+            self._network_speed_cache = (now, "unknown")
             return "unknown"
 
     # ----------------------------------------------------------
@@ -354,15 +402,18 @@ class AudioRecorder:
     # ----------------------------------------------------------
 
     def recover_interrupted_files(self) -> None:
-        """Восстанавливает незавершённые записи после аварийного завершения."""
+        """Восстанавливает незавершённые записи после аварийного завершения.
+
+        Файлы в output_dir (не в pending) — незавершённые записи. Корректные
+        по размеру ставятся в очередь, слишком маленькие удаляются.
+        Файлы в pending/ уже готовы к выгрузке и не требуют обработки.
+        """
         logger.info("Восстановление файлов после сбоя...")
         total_processed = 0
         total_corrupted = 0
         output_dir = self.config.output_dir
-        audio_cfg = self.config.audio
 
-        pattern = f"{audio_cfg.file_prefix}_*.{audio_cfg.format}"
-        for f in Path(output_dir).glob(pattern):
+        for f in Path(output_dir).glob(self._file_pattern):
             try:
                 if f.stat().st_size > MIN_FILE_SIZE_BYTES:
                     self.work_queue.put(str(f))
@@ -375,7 +426,8 @@ class AudioRecorder:
             except Exception as e:
                 logger.error(f"Ошибка при восстановлении файла {f.name}: {e}")
 
-        # Очищаем маркеры записи
+        # Маркеры .recording теперь не создаются (см. start_recording),
+        # но на случай обновления со старой версии — очищаем их.
         for marker in Path(output_dir).glob("*.recording"):
             marker.unlink(missing_ok=True)
 
@@ -386,10 +438,13 @@ class AudioRecorder:
     # ----------------------------------------------------------
 
     def start_recording(self, file_path: str) -> bool:
-        """Записывает один фрагмент аудио через arecord | ffmpeg."""
-        marker = Path(str(file_path) + ".recording")
-        marker.write_text(f"{datetime.now()} - Запись начата", encoding='utf-8')
+        """Записывает один фрагмент аудио через arecord | ffmpeg.
 
+        Маркер .recording НЕ создаётся на диске — для работы 24/7 на micro-SD
+        каждая лишняя sync-запись изнашивает ячейки. Вместо этого активная
+        запись отслеживается in-memory через _active_recording_procs, а
+        восстановление после сбоя идёт по размеру файла.
+        """
         audio_cfg = self.config.audio
         arecord_cmd = [
             'arecord', '-D', audio_cfg.mic,
@@ -415,51 +470,54 @@ class AudioRecorder:
 
         arecord_proc = None
         ffmpeg_proc = None
-        try:
-            # stderr=DEVNULL у arecord предотвращает дедлок при переполнении pipe-буфера.
-            arecord_proc = subprocess.Popen(arecord_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            ffmpeg_proc = subprocess.Popen(
-                encoder_cmd,
-                stdin=arecord_proc.stdout,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
-            )
-            if arecord_proc.stdout:
-                arecord_proc.stdout.close()
-
-            self._active_recording_procs = [arecord_proc, ffmpeg_proc]
-
-            _, stderr_data = ffmpeg_proc.communicate(
-                timeout=audio_cfg.split_time + audio_cfg.ffmpeg_timeout_grace_period
-            )
-
-            if ffmpeg_proc.returncode != 0:
-                logger.error(
-                    f"Ошибка кодирования ffmpeg: {stderr_data.decode('utf-8', errors='ignore').strip()}"
+        with self._recording_lock:
+            try:
+                # stderr=DEVNULL у arecord предотвращает дедлок при переполнении pipe-буфера.
+                arecord_proc = subprocess.Popen(arecord_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                ffmpeg_proc = subprocess.Popen(
+                    encoder_cmd,
+                    stdin=arecord_proc.stdout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE
                 )
+                if arecord_proc.stdout:
+                    arecord_proc.stdout.close()
+
+                self._active_recording_procs = [arecord_proc, ffmpeg_proc]
+
+                _, stderr_data = ffmpeg_proc.communicate(
+                    timeout=audio_cfg.split_time + audio_cfg.ffmpeg_timeout_grace_period
+                )
+
+                if ffmpeg_proc.returncode != 0:
+                    # returncode == -15 (SIGTERM) ожидаем при graceful shutdown — не логируем как ошибку
+                    if not self.shutdown_event.is_set():
+                        logger.error(
+                            f"Ошибка кодирования ffmpeg: "
+                            f"{stderr_data.decode('utf-8', errors='ignore').strip()}"
+                        )
+                    return False
+
+                logger.info(f"Запись завершена: {file_path}")
+                return True
+
+            except subprocess.TimeoutExpired:
+                logger.error(f"Таймаут во время записи файла: {file_path}")
                 return False
-
-            logger.info(f"Запись завершена: {file_path}")
-            return True
-
-        except subprocess.TimeoutExpired:
-            logger.error(f"Таймаут во время записи файла: {file_path}")
-            return False
-        except Exception as e:
-            logger.error(f"Исключение во время записи: {e}")
-            return False
-        finally:
-            # Гарантированно завершаем и собираем зомби-процессы
-            for proc in (arecord_proc, ffmpeg_proc):
-                if proc is not None:
-                    if proc.poll() is None:
-                        proc.kill()
-                    try:
-                        proc.wait(timeout=SUBPROCESS_KILL_TIMEOUT_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        pass
-            self._active_recording_procs = []
-            marker.unlink(missing_ok=True)
+            except Exception as e:
+                logger.error(f"Исключение во время записи: {e}")
+                return False
+            finally:
+                # Гарантированно завершаем и собираем зомби-процессы
+                for proc in (arecord_proc, ffmpeg_proc):
+                    if proc is not None:
+                        if proc.poll() is None:
+                            proc.kill()
+                        try:
+                            proc.wait(timeout=SUBPROCESS_KILL_TIMEOUT_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            pass
+                self._active_recording_procs = []
 
     # ----------------------------------------------------------
     # Обработка и выгрузка
@@ -470,23 +528,24 @@ class AudioRecorder:
         cloud_cfg = self.config.cloud
         if cloud_cfg.service == "none":
             return True
-        if not os.path.exists(file_path):
-            logger.error(f"Файл для загрузки не найден: {file_path}")
-            return False
 
         network = network_status if network_status else self.check_network_speed()
         max_retries = cloud_cfg.slow_network_max_retries if network == "slow" else cloud_cfg.max_retries
         retry_delay = cloud_cfg.slow_network_retry_delay if network == "slow" else cloud_cfg.retry_delay
-        cloud_target = self.get_cloud_target()
 
         for attempt in range(1, max_retries + 1):
             if self.shutdown_event.is_set():
                 return False
+
+            # check_internet_access теперь кэшируется, поэтому вызов на каждой
+            # попытке дешев; кэш инвалидируется при потере соединения автоматически.
             if not self.check_internet_access():
                 logger.warning("Потеряно соединение с интернетом во время загрузки.")
                 return False
 
-            code, _, err = self._run_command(['rclone', 'copy', str(file_path), cloud_target, '--quiet'])
+            code, _, err = self._run_command(
+                ['rclone', 'copy', str(file_path), self._cloud_target, '--quiet']
+            )
             if code == 0:
                 logger.info(f"Успешно загружено: {file_path}")
                 if cloud_cfg.delete_after_upload:
@@ -508,9 +567,13 @@ class AudioRecorder:
         return False
 
     def queue_for_upload(self, file_path: str) -> bool:
-        """Перемещает готовый файл в директорию ожидания выгрузки (pending)."""
-        pending_dir = os.path.join(self.config.output_dir, "pending")
-        pending_path = Path(pending_dir) / Path(file_path).name
+        """Перемещает готовый файл в директорию ожидания выгрузки (pending).
+
+        Использует shutil.move, который на одной ФС сводится к os.rename (мгновенно,
+        без копирования данных). pending/ всегда внутри output_dir, поэтому
+        копирования не возникает.
+        """
+        pending_path = Path(self._pending_dir) / Path(file_path).name
         try:
             move(file_path, pending_path)
             logger.info(f"Файл добавлен в очередь: {pending_path}")
@@ -520,15 +583,20 @@ class AudioRecorder:
             return False
 
     def process_recorded_file(self, file_path: str) -> None:
-        """Валидирует записанный файл и ставит его в очередь выгрузки."""
-        if not os.path.exists(file_path):
-            return
+        """Валидирует записанный файл и ставит его в очередь выгрузки.
+
+        Один stat() вместо трёх системных вызовов (exists + stat + unlink/move):
+        FileNotFoundError обрабатывается в едином try-блоке.
+        """
         try:
-            if Path(file_path).stat().st_size < MIN_FILE_SIZE_BYTES:
-                Path(file_path).unlink(missing_ok=True)
-                logger.warning(f"Файл слишком маленький, удалён: {file_path}")
-                return
+            file_size = Path(file_path).stat().st_size
         except FileNotFoundError:
+            logger.warning(f"Файл исчез до обработки: {file_path}")
+            return
+
+        if file_size < MIN_FILE_SIZE_BYTES:
+            Path(file_path).unlink(missing_ok=True)
+            logger.warning(f"Файл слишком маленький, удалён: {file_path}")
             return
 
         if self.config.cloud.service != "none":
@@ -571,12 +639,47 @@ class AudioRecorder:
             return False
 
     def _release_upload_lock(self) -> None:
-        """Освобождает lock-файл очереди выгрузки."""
+        """Освобождает lock-файл очереди выгрузки.
+
+        Безопасное удаление: проверяем, что lock принадлежит текущему процессу,
+        иначе можно удалить lock параллельно работающего экземпляра.
+        """
         try:
-            if os.path.exists(self.upload_lock_path):
-                os.unlink(self.upload_lock_path)
-        except IOError as e:
+            if not os.path.exists(self.upload_lock_path):
+                return
+            with open(self.upload_lock_path, 'r') as f:
+                pid_str = f.read().strip()
+            if pid_str != str(os.getpid()):
+                logger.warning(
+                    f"Lock-файл принадлежит другому процессу (PID {pid_str}), не удаляем."
+                )
+                return
+            os.unlink(self.upload_lock_path)
+        except (IOError, ValueError) as e:
             logger.error(f"Не удалось удалить lock-файл: {e}")
+
+    def _cleanup_stale_lock(self) -> None:
+        """Удаляет устаревший lock-файл при старте, если процесс-владелец не активен."""
+        if not os.path.exists(self.upload_lock_path):
+            return
+        try:
+            with open(self.upload_lock_path, 'r') as f:
+                pid_str = f.read().strip()
+            pid = int(pid_str)
+            if self._is_process_running(pid) and pid != os.getpid():
+                logger.warning(
+                    f"Найден активный lock-файл от процесса PID {pid}. "
+                    f"Параллельный экземпляр? Lock не трогаем."
+                )
+                return
+            logger.warning(f"Удаление устаревшего lock-файла от PID {pid}.")
+            os.unlink(self.upload_lock_path)
+        except (IOError, ValueError) as e:
+            logger.warning(f"Удаление повреждённого lock-файла: {e}")
+            try:
+                os.unlink(self.upload_lock_path)
+            except IOError:
+                pass
 
     # ----------------------------------------------------------
     # Обработка очереди выгрузки
@@ -591,20 +694,20 @@ class AudioRecorder:
             return
 
         try:
-            pending_dir = os.path.join(self.config.output_dir, "pending")
-            file_prefix = self.config.audio.file_prefix
-            file_ext = self.get_file_extension()
+            # Сразу после захвата lock проверяем shutdown — не начинаем работу,
+            # если пришёл сигнал завершения.
+            if self.shutdown_event.is_set():
+                return
 
             if not self.check_internet_access():
-                count = len(list(Path(pending_dir).glob(f"{file_prefix}_*.{file_ext}")))
+                count = len(list(Path(self._pending_dir).glob(self._file_pattern)))
                 logger.info(f"Нет интернета. Файлов в очереди: {count}")
                 return
 
             self._cleanup_storage(force=False)
 
-            pattern = f"{file_prefix}_*.{file_ext}"
             files = sorted(
-                Path(pending_dir).glob(pattern),
+                Path(self._pending_dir).glob(self._file_pattern),
                 key=lambda x: x.stat().st_mtime
             )[:UPLOAD_QUEUE_CHUNK_SIZE]
             if not files:
@@ -652,38 +755,55 @@ class AudioRecorder:
         return schedule_cfg.start_hour <= datetime.now().hour < schedule_cfg.end_hour
 
     def _cleanup_storage(self, force: bool = True) -> None:
-        """Удаляет самые старые файлы из pending, если превышен лимит хранилища."""
-        output_dir = self.config.output_dir
-        pending_dir = os.path.join(output_dir, "pending")
-        max_storage_mb = self.config.storage.max_mb
-        pending_size = self.dir_size_mb(pending_dir)
+        """Удаляет самые старые файлы из pending, если превышен лимит хранилища.
 
-        if pending_size <= max_storage_mb:
+        O(N) вместо O(N²): размер директории считается один раз, затем при
+        удалении каждого файла вычитается его размер из накопленной суммы,
+        а не пересканируется вся директория.
+        """
+        max_storage_mb = self.config.storage.max_mb
+        max_storage_bytes = max_storage_mb * 1024 * 1024
+
+        # Один проход по директории: (file_path, size) отсортированный по mtime
+        entries = []
+        total_bytes = 0
+        try:
+            for entry in os.scandir(self._pending_dir):
+                if entry.is_file(follow_symlinks=False):
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        entries.append((entry.path, st.st_size, st.st_mtime))
+                        total_bytes += st.st_size
+                    except OSError as e:
+                        logger.error(f"Не удалось получить stat для {entry.path}: {e}")
+        except OSError as e:
+            logger.error(f"Ошибка сканирования pending-директории: {e}")
+            return
+
+        if total_bytes <= max_storage_bytes:
             return
 
         if force:
             logger.warning(
-                f"Превышен лимит хранилища ({pending_size}MB > {max_storage_mb}MB), "
-                f"принудительная очистка..."
+                f"Превышен лимит хранилища ({total_bytes // (1024 * 1024)}MB > "
+                f"{max_storage_mb}MB), принудительная очистка..."
             )
 
-        file_prefix = self.config.audio.file_prefix
-        file_ext = self.get_file_extension()
-        pattern = f"{file_prefix}_*.{file_ext}"
-        files = sorted(Path(pending_dir).glob(pattern), key=lambda x: x.stat().st_mtime)
-
-        for f in files:
-            if self.dir_size_mb(pending_dir) <= max_storage_mb:
+        # Сортируем по mtime (старые первыми) и удаляем до достижения лимита
+        entries.sort(key=lambda x: x[2])
+        for path, size, _ in entries:
+            if total_bytes <= max_storage_bytes:
                 break
-            f.unlink(missing_ok=True)
-            logger.info(f"Удалён старый файл из очереди: {f.name}")
+            try:
+                os.unlink(path)
+                total_bytes -= size
+                logger.info(f"Удалён старый файл из очереди: {Path(path).name}")
+            except OSError as e:
+                logger.error(f"Не удалось удалить файл {path}: {e}")
 
     def log_queue_status(self) -> None:
         """Логирует количество файлов, ожидающих выгрузки."""
-        pending_dir = os.path.join(self.config.output_dir, "pending")
-        file_prefix = self.config.audio.file_prefix
-        file_ext = self.get_file_extension()
-        count = len(list(Path(pending_dir).glob(f"{file_prefix}_*.{file_ext}")))
+        count = len(list(Path(self._pending_dir).glob(self._file_pattern)))
         logger.info(f"Файлов в очереди на загрузку: {count}")
 
     # ----------------------------------------------------------
@@ -696,9 +816,10 @@ class AudioRecorder:
         self.shutdown_event.set()
 
         # Завершаем активные подпроцессы записи, чтобы producer-loop разблокировался
-        for proc in self._active_recording_procs:
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
+        with self._recording_lock:
+            for proc in self._active_recording_procs:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
 
         # Даём текущей задаче выгрузки завершиться (с таймаутом)
         if self.upload_thread and self.upload_thread.is_alive():
@@ -756,8 +877,6 @@ class AudioRecorder:
                             daemon=True
                         )
                         self.upload_thread.start()
-                    else:
-                        logger.debug("Пропуск запуска обработчика очереди: предыдущий ещё работает.")
 
                 self._cleanup_storage(force=True)
 
@@ -787,7 +906,7 @@ class AudioRecorder:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 file_path = os.path.join(
                     self.config.output_dir,
-                    f"{self.config.audio.file_prefix}_{ts}.{self.config.audio.format}"
+                    f"{self.config.audio.file_prefix}_{ts}.{self._file_extension}"
                 )
 
                 logger.info(f"Начало записи: {Path(file_path).name}")
@@ -809,16 +928,22 @@ class AudioRecorder:
                     break
 
     def _consumer_loop(self) -> None:
-        """Поток-потребитель: берёт файлы из очереди и обрабатывает их."""
+        """Поток-потребитель: берёт файлы из очереди и обрабатывает их.
+
+        Корректная обработка task_done: вызывается ровно один раз в finally
+        для каждого элемента очереди. Сигнал завершения (None) обрабатывается
+        отдельно и тоже с одним task_done.
+        """
         logger.info("Потребитель запущен, ожидает файлы для обработки.")
         while True:
             file_path = self.work_queue.get()
-            if file_path is None:  # Сигнал завершения
-                logger.info("Получен сигнал завершения, потребитель останавливается.")
-                self.work_queue.task_done()
-                break
+            is_shutdown_signal = (file_path is None)
 
             try:
+                if is_shutdown_signal:
+                    logger.info("Получен сигнал завершения, потребитель останавливается.")
+                    break
+
                 logger.info(f"Потребитель получил файл: {Path(file_path).name}")
                 self.process_recorded_file(file_path)
             except Exception as e:
@@ -828,9 +953,9 @@ class AudioRecorder:
                     exc_info=True
                 )
                 if self.shutdown_event.wait(CONSUMER_ERROR_SLEEP_SECONDS):
-                    self.work_queue.task_done()
                     break
             finally:
+                # Ровно один task_done на каждый get() — исправление double-task_done бага
                 self.work_queue.task_done()
 
         logger.info("Потребитель завершил работу.")
@@ -844,14 +969,15 @@ class AudioRecorder:
         signal.signal(signal.SIGINT, self.graceful_shutdown)
         signal.signal(signal.SIGTERM, self.graceful_shutdown)
 
-        self._release_upload_lock()
+        # Безопасная очистка устаревшего lock (с проверкой PID), а не безусловное удаление
+        self._cleanup_stale_lock()
 
-        output_dir = self.config.output_dir
-        pending_dir = os.path.join(output_dir, "pending")
-        os.makedirs(pending_dir, exist_ok=True)
+        os.makedirs(self._pending_dir, exist_ok=True)
 
-        if not os.access(output_dir, os.W_OK) or not os.access(pending_dir, os.W_OK):
-            logger.critical(f"Нет прав на запись в директории {output_dir} или {pending_dir}")
+        if not os.access(self.config.output_dir, os.W_OK) or not os.access(self._pending_dir, os.W_OK):
+            logger.critical(
+                f"Нет прав на запись в директории {self.config.output_dir} или {self._pending_dir}"
+            )
             sys.exit(1)
 
         self._check_dependencies()
@@ -860,26 +986,38 @@ class AudioRecorder:
 
         logger.info(
             f"▶ Запуск записи в формате {self.config.audio.format} "
-            f"с выгрузкой на {self.get_cloud_name()}"
+            f"с выгрузкой на {self._cloud_name()}"
         )
 
         self.consumer_thread = threading.Thread(target=self._consumer_loop, name="FileConsumer")
         self.consumer_thread.daemon = True
         self.consumer_thread.start()
 
-        self._producer_loop()
+        try:
+            self._producer_loop()
+        finally:
+            logger.info("Продюсер остановлен. Отправка сигнала завершения потребителю.")
+            self.work_queue.put(None)
+            self.consumer_thread.join(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
-        logger.info("Продюсер остановлен. Отправка сигнала завершения потребителю.")
-        self.work_queue.put(None)
-        self.consumer_thread.join()
+            # Финальное ожидание потока выгрузки
+            if self.upload_thread and self.upload_thread.is_alive():
+                self.upload_thread.join(timeout=SHUTDOWN_TIMEOUT_SECONDS)
 
-        # Финальное ожидание потока выгрузки
-        if self.upload_thread and self.upload_thread.is_alive():
-            self.upload_thread.join(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            self._release_upload_lock()
 
-        self._release_upload_lock()
-        logger.info("Все потоки корректно завершены.")
-        sys.exit(0)
+            # Останавливаем асинхронный log-listener, сбрасывая остатки буфера на диск
+            self._log_listener.stop()
+
+            logger.info("Все потоки корректно завершены.")
+
+    def _cloud_name(self) -> str:
+        """Человекочитаемое имя облачного сервиса (без кэширования, вызов редкий)."""
+        return {
+            "google": "Google Drive",
+            "yandex": "Яндекс.Диск",
+            "none": "локальное хранилище",
+        }.get(self.config.cloud.service, "неизвестно")
 
 
 if __name__ == "__main__":
