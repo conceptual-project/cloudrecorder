@@ -73,9 +73,9 @@ class AudioConfig(BaseModel):
     sample_rate: int = Field(48000, gt=0)
     sample_format: str = "S24_3LE"
     mic: str = "default"
-    format: Literal["opus", "aac", "mp3"] = "opus"
+    format: Literal["opus", "aac", "mp3"] = "mp3"
     bitrate: int = Field(64, gt=0)
-    file_prefix: str = "redbox"
+    file_prefix: str = "rec"
     ffmpeg_timeout_grace_period: int = Field(20, ge=5)
 
 
@@ -90,20 +90,20 @@ class CloudConfig(BaseModel):
     max_parallel_uploads: int = Field(1, gt=0)
     connectivity_timeout: int = Field(10, gt=0)
     connectivity_check_interval: int = Field(180, ge=0)
-    ping_address: str = "77.88.8.8"
+    ping_address: str = "8.8.8.8"
 
 
 class StorageConfig(BaseModel):
-    max_mb: int = Field(40960, gt=0)
+    max_mb: int = Field(25600, gt=0)
 
 
 class GoogleDriveConfig(BaseModel):
-    remote: str = "google.drive"
+    remote: str = "googledrive"
     dir: str = "/Recordings"
 
 
 class YandexDiskConfig(BaseModel):
-    remote: str = "yandex.disk"
+    remote: str = "yandexdisk"
     dir: str = "/Recordings"
 
 

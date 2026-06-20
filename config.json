@@ -36,8 +36,8 @@
     "dir": "/Recordings"
   },
   "schedule": {
-    "enabled": true,
+    "enabled": false,
     "start_hour": 8,
-    "end_hour": 18
+    "end_hour": 20
   }
 }

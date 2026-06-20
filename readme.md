@@ -1,124 +1,124 @@
 # CloudRecorder
 
-**Автоматическая запись звука с микрофона и выгрузка записанных файлов в облачное хранилище.**
+**Automatic microphone audio recording with cloud upload of recorded files.**
 
-CloudRecorder — это самостоятельное приложение на Python, предназначенное для длительной автономной записи аудио на устройствах типа Raspberry Pi или любом другом SBC. Программа записывает звук фрагментами заданной длительности, ставит готовые файлы в очередь и асинхронно загружает их в облако (Яндекс.Диск или Google Drive) через `rclone`.
-
----
-
-## Возможности
-
-- **Запись звука** с микрофона через `arecord` (ALSA) с перекодированием `ffmpeg` «на лету».
-- **Форматы кодирования** на выбор: `opus`, `aac`, `mp3` (моно, настраиваемый битрейт).
-- **Фрагментация** — запись разбивается на файлы фиксированной длительности (по умолчанию 10 минут).
-- **Выгрузка в облако** через `rclone` (Яндекс.Диск, Google Drive или отключено — только локальное хранилище).
-- **Адаптация к скорости сети**: измерение среднего пинга, отдельные лимиты повторов и задержек для медленного соединения.
-- **Параллельная загрузка** нескольких файлов одновременно (`ThreadPoolExecutor`) при быстрой сети.
-- **Работа по расписанию** — запись только в заданном окне часов (например, с 8:00 до 20:00).
-- **Контроль свободного места** на диске: при превышении лимита хранилища автоматически удаляются самые старые файлы из очереди. Параметры по-умолчанию подразумевают, что в системе есть 32 гига свободного места.
-- **Восстановление после сбоя** — при перезапуске корректно обрабатываются незавершённые записи и файлы, оставшиеся в очереди выгрузки.
-- **Ротация логов** — ежедневная, с хранением за последние 14 дней.
-- **Корректное завершение** по сигналам `SIGINT` / `SIGTERM` с ожиданием текущих задач.
-- **Запуск как systemd-сервис**.
+CloudRecorder is a standalone Python application designed for long-term autonomous audio recording on Raspberry Pi or any other SBC (Single-Board Computer). The program records audio in fragments of a specified duration, queues the finished files, and asynchronously uploads them to the cloud (Yandex Disk or Google Drive) via `rclone`.
 
 ---
 
-## Архитектура
+## Features
 
-Приложение построено по паттерну **продюсер–потребитель** с тремя потоками:
+- **Audio recording** from a microphone via `arecord` (ALSA) with on-the-fly `ffmpeg` transcoding.
+- **Encoding formats** to choose from: `opus`, `aac`, `mp3` (mono, configurable bitrate).
+- **Fragmentation** — recording is split into files of fixed duration (10 minutes by default).
+- **Cloud upload** via `rclone` (Yandex Disk, Google Drive, or disabled — local storage only).
+- **Network speed adaptation**: measures average ping, with separate retry limits and delays for slow connections.
+- **Parallel upload** of multiple files at once (`ThreadPoolExecutor`) on fast networks.
+- **Schedule-based operation** — record only within a specified time window (e.g., 08:00–20:00).
+- **Free space monitoring**: when the storage limit is exceeded, the oldest files are automatically deleted from the queue. The default parameters assume the system has 32 GB of free space.
+- **Crash recovery** — on restart, unfinished recordings and files left in the upload queue are handled correctly.
+- **Log rotation** — daily, retaining logs for the last 14 days.
+- **Graceful shutdown** on `SIGINT` / `SIGTERM` signals, waiting for in-flight tasks to complete.
+- **Runs as a systemd service**.
+
+---
+
+## Architecture
+
+The application follows a **producer–consumer** pattern with three threads:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Главный поток (Producer)                                        │
+│  Main thread (Producer)                                          │
 │  ─────────────────────────────                                   │
-│  • Проверка расписания и свободного места                        │
-│  • Запуск обработчика очереди выгрузки (по интервалу)            │
-│  • Запись фрагмента arecord | ffmpeg                             │
-│  • Помещение готового файла в work_queue                         │
+│  • Checks schedule and free disk space                           │
+│  • Launches the upload queue processor (on interval)             │
+│  • Records a fragment via arecord | ffmpeg                       │
+│  • Puts the finished file into work_queue                        │
 └───────────────────────┬──────────────────────────────────────────┘
                         │ work_queue (Queue)
                         ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  Поток-потребитель (FileConsumer, daemon)                        │
+│  Consumer thread (FileConsumer, daemon)                          │
 │  ─────────────────────────────                                   │
-│  • Берёт файл из очереди                                         │
-│  • Проверяет минимальный размер                                  │
-│  • Перемещает в директорию pending/ для выгрузки                 │
+│  • Takes a file from the queue                                   │
+│  • Validates minimum size                                        │
+│  • Moves it to the pending/ directory for upload                 │
 └───────────────────────┬──────────────────────────────────────────┘
                         │ pending/*.mp3
                         ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  Поток выгрузки (QueueProcessor, daemon)                         │
+│  Upload thread (QueueProcessor, daemon)                          │
 │  ─────────────────────────────                                   │
-│  • Защита lock-файлом (один экземпляр)                           │
-│  • Проверка интернет-соединения и скорости сети                  │
-│  • Параллельная загрузка файлов в облако через rclone copy       │
-│  • Повторные попытки с настраиваемыми задержками                 │
-│  • Удаление файлов после успешной загрузки                       │
+│  • Protected by a lock file (single instance)                    │
+│  • Checks internet connection and network speed                  │
+│  • Uploads files to the cloud in parallel via rclone copy        │
+│  • Retries with configurable delays                              │
+│  • Deletes files after successful upload                         │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Поток данных
+### Data flow
 
 ```
-output_dir/rec_20240101_120000.mp3  ──►  pending/rec_20240101_120000.mp3  ──►  Облако
-        (запись)                            (очередь выгрузки)              (rclone copy)
+output_dir/rec_20240101_120000.mp3  ──►  pending/rec_20240101_120000.mp3  ──►  Cloud
+      (recording)                          (upload queue)                 (rclone copy)
 ```
 
 ---
 
-## Требования
+## Requirements
 
-### Системные утилиты
+### System utilities
 
-| Утилита | Пакет | Назначение |
+| Utility | Package | Purpose |
 |---|---|---|
-| `arecord` | `alsa-utils` | Захват звука с микрофона |
-| `ffmpeg` | `ffmpeg` | Кодирование в opus/aac/mp3 |
-| `rclone` | `rclone` | Выгрузка в облако (не нужен при `cloud.service = "none"`) |
-| `ping` | `iputils-ping` | Оценка скорости сети |
+| `arecord` | `alsa-utils` | Microphone audio capture |
+| `ffmpeg` | `ffmpeg` | Encoding to opus/aac/mp3 |
+| `rclone` | `rclone` | Cloud upload (not required when `cloud.service = "none"`) |
+| `ping` | `iputils-ping` | Network speed estimation |
 
-### Python-библиотеки
+### Python libraries
 
-| Библиотека | Назначение |
+| Library | Purpose |
 |---|---|
-| `pydantic` (v2) | Валидация конфигурации |
+| `pydantic` (v2) | Configuration validation |
 
-Стандартная библиотека (`os`, `sys`, `threading`, `subprocess`, `logging`, `queue`, `concurrent.futures`, `pathlib`, `re`, `json`) — встроена в Python 3.8+.
+The standard library (`os`, `sys`, `threading`, `subprocess`, `logging`, `queue`, `concurrent.futures`, `pathlib`, `re`, `json`) is bundled with Python 3.8+.
 
 ---
 
-## Установка
+## Installation
 
-### 1. Установка системных зависимостей
+### 1. Install system dependencies
 
 ```bash
 sudo apt update
 sudo apt install -y alsa-utils ffmpeg rclone python3-pydantic
 ```
 
-### 2. Настройка микрофона
+### 2. Configure the microphone
 
-Проверьте, что система видит микрофон:
+Verify that the system sees the microphone:
 
 ```bash
 arecord -l
 ```
 
-В выводе найдите карточку и устройство, например `hw:1,0`. Укажите это значение в `config.json` → `audio.mic` (или используйте имя ALSA-микшера).
+Find the card and device in the output, e.g. `hw:1,0`. Set this value in `config.json` → `audio.mic` (or use an ALSA mixer name).
 
-### 3. Настройка rclone (для выгрузки в облако)
+### 3. Configure rclone (for cloud upload)
 
 ```bash
 rclone config
 ```
 
-Создайте remote с именем, совпадающим с полем `cloud.service` в конфиге:
+Create a remote whose name matches the `cloud.service` field in the config:
 
-- для Яндекс.Диска — remote `yandexdisk`;
-- для Google Drive — remote `googledrive`.
+- for Yandex Disk — remote `yandexdisk`;
+- for Google Drive — remote `googledrive`.
 
-### 4. Развёртывание файлов
+### 4. Deploy the files
 
 ```bash
 sudo mkdir -p /opt/cloudrecorder
@@ -128,164 +128,164 @@ sudo cp config.json    /opt/cloudrecorder/
 
 ---
 
-## Конфигурация
+## Configuration
 
-Вся настройка выполняется через `config.json`. Конфигурация валидируется Pydantic-моделями при запуске — при ошибке приложение выведет детальное сообщение и завершится с кодом 1.
+All settings are configured via `config.json`. The configuration is validated by Pydantic models at startup — on error, the application prints a detailed message and exits with code 1.
 
-### Полный пример с комментариями
+### Full example with comments
 
 ```jsonc
 {
-  // Базовые пути
-  "output_dir": "/opt/cloudrecorder",          // Рабочая директория (записи + pending/)
+  // Base paths
+  "output_dir": "/opt/cloudrecorder",          // Working directory (recordings + pending/)
   "log_file":   "/opt/cloudrecorder/cloudrecorder.log",
 
-  // Параметры аудиозаписи
+  // Audio recording parameters
   "audio": {
-    "split_time": 600,                          // Длительность одного фрагмента, сек
-    "sample_rate": 48000,                       // Частота дискретизации, Гц
-    "sample_format": "S24_3LE",                 // Формат сэмпла ALSA
-    "mic": "default",                           // Имя ALSA-устройства микрофона
-    "format": "mp3",                            // Целевой формат: opus | aac | mp3
-    "bitrate": 64,                              // Битрейт, кбит/с
-    "file_prefix": "rec",                       // Префикс имени файла
-    "ffmpeg_timeout_grace_period": 20           // Доп. секунды к split_time на завершение ffmpeg
+    "split_time": 600,                          // Duration of one fragment, seconds
+    "sample_rate": 48000,                       // Sample rate, Hz
+    "sample_format": "S24_3LE",                 // ALSA sample format
+    "mic": "default",                           // ALSA microphone device name
+    "format": "mp3",                            // Target format: opus | aac | mp3
+    "bitrate": 64,                              // Bitrate, kbps
+    "file_prefix": "rec",                       // File name prefix
+    "ffmpeg_timeout_grace_period": 20           // Extra seconds added to split_time for ffmpeg to finish
   },
 
-  // Выгрузка в облако
+  // Cloud upload
   "cloud": {
     "service": "yandex",                        // yandex | google | none
-    "delete_after_upload": true,                // Удалять локальный файл после успешной загрузки
-    "retry_delay": 300,                         // Задержка между попытками (мсек), норм. сеть
-    "max_retries": 15,                          // Максимум попыток, норм. сеть
-    "slow_network_retry_delay": 600,            // Задержка между попытками, медленная сеть
-    "slow_network_max_retries": 5,              // Максимум попыток, медленная сеть
-    "network_speed_threshold": 100,             // Порог среднего пинга (мс): выше = slow
-    "max_parallel_uploads": 1,                  // Параллельных потоков загрузки при быстрой сети
-    "connectivity_timeout": 10,                 // Таймаут rclone about (сек)
-    "connectivity_check_interval": 180,         // Интервал запуска обработчика очереди (сек)
-    "ping_address": "8.8.8.8"                   // Адрес для оценки скорости сети
+    "delete_after_upload": true,                // Delete local file after successful upload
+    "retry_delay": 300,                         // Delay between attempts, normal network
+    "max_retries": 15,                          // Max attempts, normal network
+    "slow_network_retry_delay": 600,            // Delay between attempts, slow network
+    "slow_network_max_retries": 5,              // Max attempts, slow network
+    "network_speed_threshold": 100,             // Average ping threshold (ms): above = slow
+    "max_parallel_uploads": 1,                  // Parallel upload threads on fast network
+    "connectivity_timeout": 10,                 // rclone about timeout (seconds)
+    "connectivity_check_interval": 180,         // Queue processor launch interval (seconds)
+    "ping_address": "8.8.8.8"                   // Address for network speed estimation
   },
 
-  // Лимиты хранилища
+  // Storage limits
   "storage": {
-    "max_mb": 25600                             // Лимит размера директории pending/ (МБ)
+    "max_mb": 25600                             // Size limit of the pending/ directory (MB)
   },
 
-  // Параметры Google Drive (если service = "google")
+  // Google Drive settings (if service = "google")
   "google_drive": {
     "remote": "googledrive",
     "dir": "/Recordings"
   },
 
-  // Параметры Яндекс.Диска (если service = "yandex")
+  // Yandex Disk settings (if service = "yandex")
   "yandex_disk": {
     "remote": "yandexdisk",
     "dir": "/Recordings"
   },
 
-  // Расписание записи
+  // Recording schedule
   "schedule": {
-    "enabled": true,                           // Включить ограничение по часам
-    "start_hour": 8,                            // Час начала (0–23)
-    "end_hour": 18                              // Час окончания (0–23), должен быть > start_hour
+    "enabled": true,                            // Enable time-window restriction
+    "start_hour": 8,                            // Start hour (0–23)
+    "end_hour": 18                              // End hour (0–23), must be > start_hour
   }
 }
 ```
 
-### Справочник по разделам
+### Section reference
 
 #### `audio`
 
-| Поле | Тип | По умолчанию | Описание |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `split_time` | int (>0) | 600 | Длительность одного файла в секундах |
-| `sample_rate` | int (>0) | 48000 | Частота дискретизации ALSA, Гц |
-| `sample_format` | str | `S24_3LE` | Формат сэмпла ALSA (S16_LE, S24_3LE, S32_LE, …) |
-| `mic` | str | `default` | Имя ALSA-устройства (`default`, `hw:1,0`, `plughw:1,0`, имя из `.asoundrc`) |
-| `format` | `opus`\|`aac`\|`mp3` | `mp3` | Целевой формат кодирования |
-| `bitrate` | int (>0) | 64 | Битрейт, кбит/с |
-| `file_prefix` | str | `rec` | Префикс имени файла (`<prefix>_YYYYMMDD_HHMMSS.<ext>`) |
-| `ffmpeg_timeout_grace_period` | int (≥5) | 20 | Доп. секунды к `split_time` на завершение кодирования |
+| `split_time` | int (>0) | 600 | Duration of a single file, in seconds |
+| `sample_rate` | int (>0) | 48000 | ALSA sample rate, Hz |
+| `sample_format` | str | `S24_3LE` | ALSA sample format (S16_LE, S24_3LE, S32_LE, …) |
+| `mic` | str | `default` | ALSA device name (`default`, `hw:1,0`, `plughw:1,0`, a name from `.asoundrc`) |
+| `format` | `opus`\|`aac`\|`mp3` | `mp3` | Target encoding format |
+| `bitrate` | int (>0) | 64 | Bitrate, kbps |
+| `file_prefix` | str | `rec` | File name prefix (`<prefix>_YYYYMMDD_HHMMSS.<ext>`) |
+| `ffmpeg_timeout_grace_period` | int (≥5) | 20 | Extra seconds added to `split_time` for encoding to finish |
 
 #### `cloud`
 
-| Поле | Тип | По умолчанию | Описание |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `service` | `yandex`\|`google`\|`none` | `google` | Облачный провайдер. `none` — только локальное хранение |
-| `delete_after_upload` | bool | `true` | Удалять локальный файл после успешной загрузки |
-| `retry_delay` | int (≥0) | 300 | Задержка между попытками (сек), нормальная сеть |
-| `max_retries` | int (≥0) | 15 | Максимум попыток, нормальная сеть |
-| `slow_network_retry_delay` | int (≥0) | 600 | Задержка между попытками (сек), медленная сеть |
-| `slow_network_max_retries` | int (≥0) | 5 | Максимум попыток, медленная сеть |
-| `network_speed_threshold` | int (>0) | 100 | Порог среднего пинга (мс); выше → сеть считается медленной |
-| `max_parallel_uploads` | int (>0) | 1 | Кол-во параллельных потоков загрузки (при медленной сети принудительно 1) |
-| `connectivity_timeout` | int (>0) | 10 | Таймаут проверки доступности облака `rclone about` (сек) |
-| `connectivity_check_interval` | int (≥0) | 180 | Интервал запуска обработчика очереди (сек) |
-| `ping_address` | str | `77.88.8.8` | IP/хост для оценки скорости сети |
+| `service` | `yandex`\|`google`\|`none` | `yandex` | Cloud provider. `none` — local storage only |
+| `delete_after_upload` | bool | `true` | Delete the local file after a successful upload |
+| `retry_delay` | int (≥0) | 300 | Delay between attempts (seconds), normal network |
+| `max_retries` | int (≥0) | 15 | Max attempts, normal network |
+| `slow_network_retry_delay` | int (≥0) | 600 | Delay between attempts (seconds), slow network |
+| `slow_network_max_retries` | int (≥0) | 5 | Max attempts, slow network |
+| `network_speed_threshold` | int (>0) | 100 | Average ping threshold (ms); above → network is considered slow |
+| `max_parallel_uploads` | int (>0) | 1 | Number of parallel upload threads (forced to 1 on slow networks) |
+| `connectivity_timeout` | int (>0) | 10 | Cloud availability check timeout via `rclone about` (seconds) |
+| `connectivity_check_interval` | int (≥0) | 180 | Queue processor launch interval (seconds) |
+| `ping_address` | str | `8.8.8.8` | IP/host for network speed estimation |
 
 #### `storage`
 
-| Поле | Тип | По умолчанию | Описание |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `max_mb` | int (>0) | 25600 | Лимит размера директории `pending/` в МБ. При превышении удаляются самые старые файлы |
+| `max_mb` | int (>0) | 25600 | Size limit of the `pending/` directory in MB. When exceeded, the oldest files are deleted |
 
 #### `google_drive` / `yandex_disk`
 
-| Поле | Тип | По умолчанию | Описание |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `remote` | str | `googledrive` / `yandexdisk` | Имя rclone-remote (из `rclone config`) |
-| `dir` | str | `/Recordings` | Путь к папке в облаке |
+| `remote` | str | `googledrive` / `yandexdisk` | rclone remote name (from `rclone config`) |
+| `dir` | str | `/Recordings` | Path to the folder in the cloud |
 
 #### `schedule`
 
-| Поле | Тип | По умолчанию | Описание |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | Включить ограничение записи по часам |
-| `start_hour` | int (0–23) | 8 | Час начала окна записи |
-| `end_hour` | int (0–23) | 20 | Час окончания окна записи (должен быть больше `start_hour`) |
+| `enabled` | bool | `false` | Enable recording time-window restriction |
+| `start_hour` | int (0–23) | 8 | Start hour of the recording window |
+| `end_hour` | int (0–23) | 20 | End hour of the recording window (must be greater than `start_hour`) |
 
 ---
 
-## Запуск
+## Running
 
-### Ручной запуск
+### Manual run
 
 ```bash
 cd /opt/cloudrecorder
 python3 cloudrecorder.py config.json
 ```
 
-Если путь к конфигу не указан, используется `config.json` в текущей директории.
+If the config path is not provided, `config.json` in the current directory is used.
 
-### Запуск как systemd-сервис
+### Run as a systemd service
 
-1. Скопируйте unit-файл:
+1. Copy the unit file:
 
    ```bash
    sudo cp cloudrecorder.service /etc/systemd/system/
    ```
 
-2. Перезагрузите конфигурацию systemd и включите автозапуск:
+2. Reload the systemd configuration and enable autostart:
 
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable --now cloudrecorder.service
    ```
 
-3. Проверьте статус:
+3. Check the status:
 
    ```bash
    sudo systemctl status cloudrecorder.service
    ```
 
-4. Просмотр логов сервиса:
+4. View the service logs:
 
    ```bash
    sudo journalctl -u cloudrecorder.service -f
    ```
 
-Содержимое `cloudrecorder.service`:
+Contents of `cloudrecorder.service`:
 
 ```ini
 [Unit]
@@ -308,20 +308,19 @@ WantedBy=multi-user.target
 
 ---
 
-## Структура директорий
+## Directory structure
 
-После первого запуска в `output_dir` создаётся следующая структура:
+After the first launch, the following structure is created in `output_dir`:
 
 ```
 /opt/cloudrecorder/
-├── cloudrecorder.py            # Исполняемый скрипт (или cloudrecorder.bin)
-├── config.json                 # Конфигурация
-├── cloudrecorder.log           # Текущий лог
-├── cloudrecorder.log.1         # Вчерашний лог (ротация)
-├── rec_20240101_120000.mp3     # Активная/свежая запись (после обработки перемещается в pending)
-├── rec_20240101_120000.mp3.recording  # Маркер идущей записи (удаляется по завершении)
-├── upload.lock                 # Lock-файл обработчика очереди (временный)
-└── pending/                    # Очередь файлов на выгрузку
+├── cloudrecorder.py            # Executable script (or cloudrecorder.bin)
+├── config.json                 # Configuration
+├── cloudrecorder.log           # Current log
+├── cloudrecorder.log.1         # Yesterday's log (rotated)
+├── rec_20240101_120000.mp3     # Active/fresh recording (moved to pending after processing)
+├── upload.lock                 # Queue processor lock file (temporary)
+└── pending/                    # Queue of files pending upload
     ├── rec_20240101_110000.mp3
     ├── rec_20240101_113000.mp3
     └── ...
@@ -329,87 +328,87 @@ WantedBy=multi-user.target
 
 ---
 
-## Логирование
+## Logging
 
-- Логи пишутся одновременно в файл (`log_file`) и в `stdout`.
-- Формат: `YYYY-MM-DD HH:MM:SS,mmm - LEVEL - ThreadName - message`.
-- Ротация: ежедневно в полночь, хранятся логи за последние **14 дней** (`LOG_RETENTION_DAYS`).
-- Уровень логирования: `INFO`.
+- Logs are written simultaneously to a file (`log_file`) and to `stdout`.
+- Format: `YYYY-MM-DD HH:MM:SS,mmm - LEVEL - ThreadName - message`.
+- Rotation: daily at midnight, retaining logs for the last **14 days** (`LOG_RETENTION_DAYS`).
+- Log level: `INFO`.
 
-Пример записи лога:
+Example log entries:
 
 ```
-2024-01-01 12:00:00,123 - INFO - MainThread      - ▶ Запуск записи в формате opus с выгрузкой на Яндекс Диск
-2024-01-01 12:00:00,456 - INFO - MainThread      - Начало записи: rec_20240101_120000.mp3
-2024-01-01 12:10:05,789 - INFO - MainThread      - Запись завершена: /opt/cloudrecorder/rec_20240101_120000.mp3
-2024-01-01 12:10:06,012 - INFO - FileConsumer    - Потребитель получил файл: rec_20240101_120000.mp3
-2024-01-01 12:10:06,234 - INFO - FileConsumer    - Файл добавлен в очередь: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
-2024-01-01 12:13:00,567 - INFO - QueueProcessor  - Обработка очереди (1 файлов, сеть: fast, потоков: 1)
-2024-01-01 12:13:45,890 - INFO - Uploader_0      - Успешно загружено: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
-2024-01-01 12:13:45,901 - INFO - Uploader_0      - Файл удалён: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
+2024-01-01 12:00:00,123 - INFO - MainThread      - ▶ Starting recording in mp3 format with upload to Yandex Disk
+2024-01-01 12:00:00,456 - INFO - MainThread      - Recording started: rec_20240101_120000.mp3
+2024-01-01 12:10:05,789 - INFO - MainThread      - Recording finished: /opt/cloudrecorder/rec_20240101_120000.mp3
+2024-01-01 12:10:06,012 - INFO - FileConsumer    - Consumer received file: rec_20240101_120000.mp3
+2024-01-01 12:10:06,234 - INFO - FileConsumer    - File added to queue: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
+2024-01-01 12:13:00,567 - INFO - QueueProcessor  - Processing queue (1 files, network: fast, threads: 1)
+2024-01-01 12:13:45,890 - INFO - Uploader_0      - Successfully uploaded: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
+2024-01-01 12:13:45,901 - INFO - Uploader_0      - File deleted: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
 ```
 
 ---
 
-## Поведение при сбоях
+## Failure behavior
 
-### Аварийное завершение во время записи
+### Crash during recording
 
-- Остаются «осиротевшие» файлы записей и маркеры `*.recording`.
-- При следующем запуске `recover_interrupted_files()`:
-  - файлы больше `MIN_FILE_SIZE_BYTES` (1024 байт) ставятся в очередь на обработку;
-  - файлы меньшего размера удаляются как повреждённые;
-  - маркеры `*.recording` очищаются.
+- Orphaned recording files may be left in `output_dir`.
+- On the next launch, `recover_interrupted_files()`:
+  - files larger than `MIN_FILE_SIZE_BYTES` (1024 bytes) are queued for processing;
+  - smaller files are deleted as corrupted.
+- Active recording subprocesses are tracked in memory; on graceful shutdown they receive `SIGTERM` and are reaped.
 
-### Потеря интернет-соединения
+### Internet connection loss
 
-- При недоступности облака (`rclone about` не отвечает) обработчик очереди пропускает цикл.
-- Файлы остаются в `pending/` до восстановления соединения.
-- Если `pending/` превышает лимит `storage.max_mb`, автоматически удаляются самые старые файлы.
+- When the cloud is unreachable (`rclone about` does not respond), the queue processor skips the cycle.
+- Files remain in `pending/` until the connection is restored.
+- If `pending/` exceeds the `storage.max_mb` limit, the oldest files are automatically deleted.
 
-### Критически мало места на диске
+### Critically low disk space
 
-- Перед каждой новой записью проверяется свободное место.
-- Порог: `min(10% от total, 1 ГБ)` свободного места (`DISK_FREE_PERCENTAGE`, `DISK_FREE_MIN_BYTES`).
-- При нехватке запись приостанавливается до освобождения места.
+- Free space is checked before each new recording.
+- Threshold: `min(10% of total, 1 GB)` of free space (`DISK_FREE_PERCENTAGE`, `DISK_FREE_MIN_BYTES`).
+- When insufficient, recording is paused until space is freed.
 
-### Корректное завершение (SIGINT / SIGTERM)
+### Graceful shutdown (SIGINT / SIGTERM)
 
-- Устанавливается `shutdown_event`.
-- Активные подпроцессы `arecord`/`ffmpeg` получают `SIGTERM`.
-- Текущий цикл выгрузки ожидается с таймаутом 10 секунд.
-- Все ожидания (`time.sleep`) заменены на прерываемые `shutdown_event.wait()`, что обеспечивает быстрый и корректный выход.
+- `shutdown_event` is set.
+- Active `arecord`/`ffmpeg` subprocesses receive `SIGTERM`.
+- The current upload cycle is awaited with a 10-second timeout.
+- All waits (`time.sleep`) are replaced with interruptible `shutdown_event.wait()`, ensuring a fast and clean exit.
 
 ---
 
-## Сборка бинарника (опционально)
+## Building a binary (optional)
 
-Для развёртывания на целевом устройстве скрипт можно скомпилировать в один бинарник с помощью **Nuitka**:
+For deployment on the target device, the script can be compiled into a single binary using **Nuitka**:
 
 ```bash
-# Установка Nuitka
+# Install Nuitka
 pipx install nuitka
 
-# Компиляция
+# Compile
 nuitka --lto=yes cloudrecorder.py
 ```
 
-Результат — единый исполняемый файл `cloudrecorder.bin`, который разворачивается вместе с `config.json`. Подробности — в `readme.html`.
+The result is a single executable file `cloudrecorder.bin` that is deployed alongside `config.json`. See `readme.html` for details.
 
 ---
 
-## Файловый состав проекта
+## Project file structure
 
 ```
 cloudrecorder/
-├── cloudrecorder.py        # Главный скрипт (~890 строк, единый файл)
-├── config.json             # Конфигурация по умолчанию
-├── cloudrecorder.service   # systemd unit-файл
-└── readme.md               # Инструкция по сборке и развёртыванию бинарника
+├── cloudrecorder.py        # Main script (~890 lines, single file)
+├── config.json             # Default configuration
+├── cloudrecorder.service   # systemd unit file
+└── readme.html             # Binary build and deployment guide
 ```
 
 ---
 
-## Лицензия
+## License
 
-GNU GPL V3
+GNU GPL v3
