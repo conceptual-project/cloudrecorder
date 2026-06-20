@@ -115,8 +115,8 @@ rclone config
 
 Создайте remote с именем, совпадающим с полем `cloud.service` в конфиге:
 
-- для Яндекс.Диска — remote `yandex.disk`;
-- для Google Drive — remote `google.drive`.
+- для Яндекс.Диска — remote `yandexdisk`;
+- для Google Drive — remote `googledrive`.
 
 ### 4. Развёртывание файлов
 
@@ -146,9 +146,9 @@ sudo cp config.json    /opt/cloudrecorder/
     "sample_rate": 48000,                       // Частота дискретизации, Гц
     "sample_format": "S24_3LE",                 // Формат сэмпла ALSA
     "mic": "default",                           // Имя ALSA-устройства микрофона
-    "format": "opus",                           // Целевой формат: opus | aac | mp3
+    "format": "mp3",                            // Целевой формат: opus | aac | mp3
     "bitrate": 64,                              // Битрейт, кбит/с
-    "file_prefix": "redbox",                    // Префикс имени файла
+    "file_prefix": "rec",                       // Префикс имени файла
     "ffmpeg_timeout_grace_period": 20           // Доп. секунды к split_time на завершение ffmpeg
   },
 
@@ -169,26 +169,26 @@ sudo cp config.json    /opt/cloudrecorder/
 
   // Лимиты хранилища
   "storage": {
-    "max_mb": 40960                             // Лимит размера директории pending/ (МБ)
+    "max_mb": 25600                             // Лимит размера директории pending/ (МБ)
   },
 
   // Параметры Google Drive (если service = "google")
   "google_drive": {
-    "remote": "google.drive",
+    "remote": "googledrive",
     "dir": "/Recordings"
   },
 
   // Параметры Яндекс.Диска (если service = "yandex")
   "yandex_disk": {
-    "remote": "yandex.disk",
+    "remote": "yandexdisk",
     "dir": "/Recordings"
   },
 
   // Расписание записи
   "schedule": {
-    "enabled": false,                           // Включить ограничение по часам
+    "enabled": true,                           // Включить ограничение по часам
     "start_hour": 8,                            // Час начала (0–23)
-    "end_hour": 20                              // Час окончания (0–23), должен быть > start_hour
+    "end_hour": 18                              // Час окончания (0–23), должен быть > start_hour
   }
 }
 ```
@@ -234,7 +234,7 @@ sudo cp config.json    /opt/cloudrecorder/
 
 | Поле | Тип | По умолчанию | Описание |
 |---|---|---|---|
-| `remote` | str | `google.drive` / `yandex.disk` | Имя rclone-remote (из `rclone config`) |
+| `remote` | str | `googledrive` / `yandexdisk` | Имя rclone-remote (из `rclone config`) |
 | `dir` | str | `/Recordings` | Путь к папке в облаке |
 
 #### `schedule`
@@ -318,12 +318,12 @@ WantedBy=multi-user.target
 ├── config.json                 # Конфигурация
 ├── cloudrecorder.log           # Текущий лог
 ├── cloudrecorder.log.1         # Вчерашний лог (ротация)
-├── redbox_20240101_120000.opus # Активная/свежая запись (после обработки перемещается в pending)
-├── redbox_20240101_120000.opus.recording  # Маркер идущей записи (удаляется по завершении)
+├── rec_20240101_120000.mp3     # Активная/свежая запись (после обработки перемещается в pending)
+├── rec_20240101_120000.mp3.recording  # Маркер идущей записи (удаляется по завершении)
 ├── upload.lock                 # Lock-файл обработчика очереди (временный)
 └── pending/                    # Очередь файлов на выгрузку
-    ├── redbox_20240101_110000.opus
-    ├── redbox_20240101_113000.opus
+    ├── redbox_20240101_110000.mp3
+    ├── redbox_20240101_113000.mp3
     └── ...
 ```
 
@@ -339,14 +339,14 @@ WantedBy=multi-user.target
 Пример записи лога:
 
 ```
-2024-01-01 12:00:00,123 - INFO - MainThread      - ▶ Запуск записи в формате opus с выгрузкой на Яндекс.Диск
-2024-01-01 12:00:00,456 - INFO - MainThread      - Начало записи: redbox_20240101_120000.opus
-2024-01-01 12:10:05,789 - INFO - MainThread      - Запись завершена: /opt/cloudrecorder/redbox_20240101_120000.opus
-2024-01-01 12:10:06,012 - INFO - FileConsumer    - Потребитель получил файл: redbox_20240101_120000.opus
-2024-01-01 12:10:06,234 - INFO - FileConsumer    - Файл добавлен в очередь: /opt/cloudrecorder/pending/redbox_20240101_120000.opus
+2024-01-01 12:00:00,123 - INFO - MainThread      - ▶ Запуск записи в формате opus с выгрузкой на Яндекс Диск
+2024-01-01 12:00:00,456 - INFO - MainThread      - Начало записи: rec_20240101_120000.mp3
+2024-01-01 12:10:05,789 - INFO - MainThread      - Запись завершена: /opt/cloudrecorder/rec_20240101_120000.mp3
+2024-01-01 12:10:06,012 - INFO - FileConsumer    - Потребитель получил файл: rec_20240101_120000.mp3
+2024-01-01 12:10:06,234 - INFO - FileConsumer    - Файл добавлен в очередь: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
 2024-01-01 12:13:00,567 - INFO - QueueProcessor  - Обработка очереди (1 файлов, сеть: fast, потоков: 1)
-2024-01-01 12:13:45,890 - INFO - Uploader_0      - Успешно загружено: /opt/cloudrecorder/pending/redbox_20240101_120000.opus
-2024-01-01 12:13:45,901 - INFO - Uploader_0      - Файл удалён: /opt/cloudrecorder/pending/redbox_20240101_120000.opus
+2024-01-01 12:13:45,890 - INFO - Uploader_0      - Успешно загружено: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
+2024-01-01 12:13:45,901 - INFO - Uploader_0      - Файл удалён: /opt/cloudrecorder/pending/rec_20240101_120000.mp3
 ```
 
 ---
@@ -412,4 +412,4 @@ cloudrecorder/
 
 ## Лицензия
 
-Проект распространяется для внутреннего использования. Все торговые марки (Яндекс.Диск, Google Drive, Icecast, Raspberry Pi) принадлежат их владельцам.
+GNU GPL V3
