@@ -1,0 +1,43 @@
+{
+  "output_dir": "/opt/cloudrecorder",
+  "log_file": "/opt/cloudrecorder/cloudrecorder.log",
+  "audio": {
+    "split_time": 600,
+    "sample_rate": 48000,
+    "sample_format": "S24_3LE",
+    "mic": "default",
+    "format": "opus",
+    "bitrate": 64,
+    "file_prefix": "redbox",
+    "ffmpeg_timeout_grace_period": 20
+  },
+  "cloud": {
+    "service": "yandex",
+    "delete_after_upload": true,
+    "retry_delay": 300,
+    "max_retries": 15,
+    "slow_network_retry_delay": 600,
+    "slow_network_max_retries": 5,
+    "network_speed_threshold": 100,
+    "max_parallel_uploads": 1,
+    "connectivity_timeout": 10,
+    "connectivity_check_interval": 180,
+    "ping_address": "77.88.8.8"
+  },
+  "storage": {
+    "max_mb": 40960
+  },
+  "google_drive": {
+    "remote": "google.drive",
+    "dir": "/Recordings"
+  },
+  "yandex_disk": {
+    "remote": "yandex.disk",
+    "dir": "/Recordings"
+  },
+  "schedule": {
+    "enabled": false,
+    "start_hour": 8,
+    "end_hour": 20
+  }
+}

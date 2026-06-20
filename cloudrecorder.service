@@ -1,0 +1,16 @@
+[Unit]
+Description=CloudRecorder - Audio Recorder with Cloud Upload
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cloudrecorder
+ExecStart=/opt/cloudrecorder/cloudrecorder.bin /opt/cloudrecorder/config.json
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
