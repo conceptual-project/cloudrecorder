@@ -6,9 +6,9 @@
     "sample_rate": 48000,
     "sample_format": "S24_3LE",
     "mic": "default",
-    "format": "opus",
+    "format": "mp3",
     "bitrate": 64,
-    "file_prefix": "redbox",
+    "file_prefix": "rec",
     "ffmpeg_timeout_grace_period": 20
   },
   "cloud": {
@@ -22,22 +22,22 @@
     "max_parallel_uploads": 1,
     "connectivity_timeout": 10,
     "connectivity_check_interval": 180,
-    "ping_address": "77.88.8.8"
+    "ping_address": "8.8.8.8"
   },
   "storage": {
-    "max_mb": 40960
+    "max_mb": 25600
   },
   "google_drive": {
-    "remote": "google.drive",
+    "remote": "googledrive",
     "dir": "/Recordings"
   },
   "yandex_disk": {
-    "remote": "yandex.disk",
+    "remote": "yandexdisk",
     "dir": "/Recordings"
   },
   "schedule": {
-    "enabled": false,
+    "enabled": true,
     "start_hour": 8,
-    "end_hour": 20
+    "end_hour": 18
   }
 }
