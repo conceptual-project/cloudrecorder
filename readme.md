@@ -404,7 +404,7 @@ cloudrecorder/
 ├── cloudrecorder.py        # Main script (~890 lines, single file)
 ├── config.json             # Default configuration
 ├── cloudrecorder.service   # systemd unit file
-└── readme.html             # Binary build and deployment guide
+└── readme.md               # Binary build and deployment guide
 ```
 
 ---
