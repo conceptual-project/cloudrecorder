@@ -59,12 +59,24 @@ SUBPROCESS_KILL_TIMEOUT_SECONDS = 5         # Таймаут ожидания з
 CONNECTIVITY_TIMEOUT_MULTIPLIER = 2         # Множитель таймаута для rclone about (рукопожатие авторизации)
 
 # Кэширование дорогих сетевых/системных проверок (защита micro-SD от лишних процессов)
-CONNECTIVITY_CACHE_TTL_SECONDS = 60         # TTL кэша check_internet_access
+CONNECTIVITY_CACHE_TTL_SECONDS = 60         # TTL положительного кэша check_internet_access (сеть есть)
+CONNECTIVITY_NEG_CACHE_TTL_SECONDS = 15     # TTL отрицательного кэша (сети нет) — перепроверяем чаще
 NETWORK_SPEED_CACHE_TTL_SECONDS = 300       # TTL кэша check_network_speed
 CLEANUP_SCAN_MIN_INTERVAL_SECONDS = 60      # Минимальный интервал между сканированиями pending/
 
 # Поддерживаемые ffmpeg-кодировщики по форматам конфига
 FFMPEG_ENCODERS: Dict[str, str] = {"opus": "libopus", "aac": "aac", "mp3": "libmp3lame"}
+
+# Флаги rclone, гарантирующие ограниченное время выполнения каждой операции.
+# Критично для устройств с нестабильным интернетом: без них rclone copy может
+# висеть бесконечно при обрыве соединения, блокируя поток обработки очереди
+# (ThreadPoolExecutor.__exit__ ждёт завершения всех future). Свою логику повторов
+# (--retries=1) мы реализуем в upload_to_cloud, чтобы контролировать задержки.
+RCLONE_IO_FLAGS: List[str] = [
+    '--contimeout=15s',          # таймаут установки соединения
+    '--timeout=60s',             # таймаут I/O операций (read/write)
+    '--low-level-retries=5',     # повтор HTTP-запросов на низком уровне
+]
 
 
 # ========================================================
@@ -369,7 +381,11 @@ class AudioRecorder:
 
         now = time.time()
         cached_at, cached_result = self._connectivity_cache
-        if now - cached_at < CONNECTIVITY_CACHE_TTL_SECONDS:
+        # Положительный кэш живёт дольше (сеть есть — нет смысла перепроверять),
+        # отрицательный — меньше (сеть пропала — хотим быстрее заметить восстановление).
+        # Это критично для нестабильного интернета: сокращает «слепое окно» после обрыва.
+        ttl = CONNECTIVITY_CACHE_TTL_SECONDS if cached_result else CONNECTIVITY_NEG_CACHE_TTL_SECONDS
+        if now - cached_at < ttl:
             return cached_result
 
         if not self._cloud_target:
@@ -378,7 +394,11 @@ class AudioRecorder:
 
         timeout = self.config.cloud.connectivity_timeout * CONNECTIVITY_TIMEOUT_MULTIPLIER
         cloud_remote = self._cloud_target.split(':')[0]
-        code, _, _ = self._run_command(['rclone', 'about', f'{cloud_remote}:'], timeout=timeout)
+        # --contimeout/--timeout защищают от зависания `rclone about` при потере сети.
+        code, _, _ = self._run_command(
+            ['rclone', 'about', f'{cloud_remote}:', '--contimeout=10s', '--timeout=15s'],
+            timeout=timeout
+        )
         result = code == 0
         self._connectivity_cache = (now, result)
         return result
@@ -443,9 +463,9 @@ class AudioRecorder:
         output_dir = self.config.output_dir
 
         for f in Path(output_dir).glob(self._file_pattern):
-            # Пропускаем уже обработанные файлы (суффикс .done из режима "none").
-            if f.suffix == ".done" or f.name.endswith(".done"):
-                continue
+            # Глоб _file_pattern = "prefix_*.ext" не матчит файлы с суффиксом .done
+            # (они заканчиваются на ".done", а не на ".ext"), поэтому отдельная
+            # проверка .done здесь не нужна — processed-файлы режима "none" не попадают.
             try:
                 if f.stat().st_size > MIN_FILE_SIZE_BYTES:
                     self.work_queue.put(str(f))
@@ -529,10 +549,19 @@ class AudioRecorder:
                     # returncode == -15 (SIGTERM) ожидаем при graceful shutdown — не логируем как ошибку
                     if not self.shutdown_event.is_set():
                         logger.error(
-                            f"Ошибка кодирования ffmpeg: "
+                            f"Ошибка кодирования ffmpeg (rc={ffmpeg_proc.returncode}): "
                             f"{stderr_data.decode('utf-8', errors='ignore').strip()}"
                         )
                     return False
+
+                # arecord завершается первым и передаёт данные в ffmpeg; проверяем его код,
+                # чтобы диагностировать проблемы с микрофоном (занят, отключён, нет прав).
+                # None — ещё не собран (нормально, finally доберёт); 0 — штатно.
+                if arecord_proc.returncode not in (None, 0):
+                    logger.warning(
+                        f"arecord завершился с кодом {arecord_proc.returncode} "
+                        f"(возможны проблемы с микрофоном). Файл сохранён, но может быть неполным: {file_path}"
+                    )
 
                 logger.info(f"Запись завершена: {file_path}")
                 return True
@@ -579,8 +608,12 @@ class AudioRecorder:
                 logger.warning("Потеряно соединение с интернетом во время загрузки.")
                 return False
 
+            # --retries=1: rclone не делает внутренних повторов — нашу логику повторов
+            # с задержками реализует upload_to_cloud. RCLONE_IO_FLAGS ограничивают время
+            # одной попытки, предотвращая зависание потока на нестабильной сети.
             code, _, err = self._run_command(
-                ['rclone', 'copy', str(file_path), self._cloud_target, '--quiet']
+                ['rclone', 'copy', str(file_path), self._cloud_target, '--quiet', '--retries=1']
+                + RCLONE_IO_FLAGS
             )
             if code == 0:
                 logger.info(f"Успешно загружено: {file_path}")
@@ -658,7 +691,7 @@ class AudioRecorder:
     # Преимущества flock перед PID-based lock:
     #   1. Атомарность — нет TOCTOU-окна между exists() и open().
     #   2. Авто-освобождение при завершении процесса, ВКЛЮЧАЯ SIGKILL —
-    #      ядро закрывает fd и flock снимается. Не нужно _cleanup_stale_lock().
+    #      ядро закрывает fd и flock снимается — чистить устаревшие lock-файлы не нужно.
     #   3. Не подвержен PID recycling (long-running системы, где PID может
     #      быть переиспользован другим процессом).
     # ----------------------------------------------------------
@@ -706,16 +739,6 @@ class AudioRecorder:
         finally:
             self._lock_fd = None
 
-    def _cleanup_stale_lock(self) -> None:
-        """No-op для совместимости с предыдущей версией API.
-
-        flock автоматически освобождается ядром при смерти процесса-владельца,
-        поэтому устаревших lock-файлов в принципе не бывает. Метод оставлен,
-        чтобы не ломать точку вызова в run(); при желании его можно удалить
-        вместе с вызовом.
-        """
-        return
-
     # ----------------------------------------------------------
     # Обработка очереди выгрузки
     # ----------------------------------------------------------
@@ -735,7 +758,9 @@ class AudioRecorder:
                 return
 
             if not self.check_internet_access():
-                count = len(list(Path(self._pending_dir).glob(self._file_pattern)))
+                # sum(1 for _) вместо len(list(...)) — не загружает все Path-объекты в память
+                # одновременно (актуально при тысячах файлов в очереди на медленной micro-SD).
+                count = sum(1 for _ in Path(self._pending_dir).glob(self._file_pattern))
                 logger.info(f"Нет интернета. Файлов в очереди: {count}")
                 return
 
@@ -749,13 +774,20 @@ class AudioRecorder:
                 return
 
             network = self.check_network_speed()
-            max_workers = 1 if network == "slow" else self.config.cloud.max_parallel_uploads
+            # На unknown-сети (ping не прошёл) действуем консервативно — 1 поток,
+            # как на slow. Это безопаснее для Pi Zero 2 W (512 МБ ОЗУ) и для
+            # нестабильного соединения, где параллельные загрузки только усугубляют
+            # contention. На fast — используем сконфигурированное значение.
+            max_workers = 1 if network != "fast" else self.config.cloud.max_parallel_uploads
             logger.info(f"Обработка очереди ({len(files)} файлов, сеть: {network}, потоков: {max_workers})")
 
-            # ВАЖНО: shutdown(wait=False) на выходе из with НЕ прерывает уже
-            # запущенные загрузки (rclone). Это сознательное решение — обрывать
-            # загружаемый в облако файл = битый файл в облаке. upload_to_cloud()
-            # сам проверяет shutdown_event и быстро выходит между попытками.
+            # with-block вызывает ThreadPoolExecutor.__exit__ → shutdown(wait=True),
+            # т.е. мы ДОЖИДАЕМСЯ завершения уже запущенных загрузок. Это сознательное
+            # решение — обрывать загружаемый в облако файл = битый файл в облаке.
+            # Чтобы shutdown не завис навечно при зависшем rclone, каждой команде rclone
+            # переданы --timeout/--contimeout (RCLONE_IO_FLAGS), гарантируя ограниченное
+            # время выполнения. upload_to_cloud() дополнительно проверяет shutdown_event
+            # между попытками и быстро выходит.
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='Uploader') as executor:
                 if self.shutdown_event.is_set():
                     return
@@ -809,11 +841,14 @@ class AudioRecorder:
         чтобы исключить двойное удаление одного и того же файла.
 
         Защита micro-SD: между полными сканированиями соблюдаем
-        CLEANUP_SCAN_MIN_INTERVAL_SECONDS, даже если force=True.
+        CLEANUP_SCAN_MIN_INTERVAL_SECONDS — независимо от force (раньше
+        force=True обходил throttle, что противоречило комментарию и могло
+        вызывать частые scandir при быстрых ошибках записи).
+        Параметр force теперь влияет только на логирование (warning при превышении).
         """
-        # Throttling: не чаще, чем раз в CLEANUP_SCAN_MIN_INTERVAL_SECONDS.
+        # Throttling: не чаще, чем раз в CLEANUP_SCAN_MIN_INTERVAL_SECONDS — для всех вызовов.
         now = time.time()
-        if not force and (now - self._last_cleanup_scan) < CLEANUP_SCAN_MIN_INTERVAL_SECONDS:
+        if (now - self._last_cleanup_scan) < CLEANUP_SCAN_MIN_INTERVAL_SECONDS:
             return
 
         # acquire(blocking=False): если cleanup уже идёт в другом потоке —
@@ -870,7 +905,8 @@ class AudioRecorder:
 
     def log_queue_status(self) -> None:
         """Логирует количество файлов, ожидающих выгрузки."""
-        count = len(list(Path(self._pending_dir).glob(self._file_pattern)))
+        # sum(1 for _) — генератор, не материализует список Path-объектов в памяти.
+        count = sum(1 for _ in Path(self._pending_dir).glob(self._file_pattern))
         logger.info(f"Файлов в очереди на загрузку: {count}")
 
     # ----------------------------------------------------------
@@ -880,39 +916,45 @@ class AudioRecorder:
     def graceful_shutdown(self, signum: int, frame) -> None:
         """Обработчик сигналов SIGINT/SIGTERM: инициирует корректную остановку.
 
-        Использует RLock (а не Lock), что позволяет signal handler'у повторно
-        войти в замок, удерживаемый start_recording() — без этого был бы deadlock.
+        Signal handler должен быть максимально коротким и НЕ вызывать блокирующие
+        операции (join) — иначе он подвешивает главный поток, в котором и выполняется
+        (сигналы в Python доставляются в основной поток между байткодами). Раньше здесь
+        был upload_thread.join(timeout=...) — это блокировало главный поток на до 10с
+        прямо внутри обработчика, задерживая выход start_recording/communicate.
+
+        Теперь обработчик только:
+          1. выставляет shutdown_event (все циклы проверяют его и выходят);
+          2. терминирует активные подпроцессы записи, чтобы producer-loop
+             разблокировался из communicate().
+        Финальное ожидание потоков выполняется в run() после возврата из
+        _producer_loop — это правильное место для join().
+
+        RLock позволяет signal handler'у повторно войти в замок, удерживаемый
+        start_recording() — без этого был бы deadlock.
         """
-        logger.info(f"Получен сигнал {signum}, завершение работы...")
+        logger.info(f"Получен сигнал {signum}, инициирую завершение работы...")
         self.shutdown_event.set()
 
-        # Завершаем активные подпроцессы записи, чтобы producer-loop разблокировался.
-        # RLock корректно отрабатывает даже если start_recording держит этот замок.
         with self._recording_lock:
             for proc in self._active_recording_procs:
                 if proc is not None and proc.poll() is None:
                     proc.terminate()
-
-        # Даём текущей задаче выгрузки завершиться (с таймаутом)
-        if self.upload_thread and self.upload_thread.is_alive():
-            logger.info("Ожидание завершения текущей задачи загрузки...")
-            self.upload_thread.join(timeout=SHUTDOWN_TIMEOUT_SECONDS)
-            if self.upload_thread.is_alive():
-                # Поток не успел завершиться за таймаут — он daemon, процесс всё
-                # равно выйдет, но возможна недозагруженная/битая запись в облаке.
-                logger.warning(
-                    f"Upload-поток не завершился за {SHUTDOWN_TIMEOUT_SECONDS}с, "
-                    f"принудительное завершение процесса (возможна битая запись)."
-                )
-
-        logger.info("Сигнал обработан, ожидание естественного завершения циклов.")
 
     # ----------------------------------------------------------
     # Главные циклы
     # ----------------------------------------------------------
 
     def _producer_loop(self) -> None:
-        """Главный цикл: запись фрагментов и запуск обработки очереди."""
+        """Главный цикл: запись фрагментов и запуск обработки очереди.
+
+        ВАЖНО: обработка очереди выгрузки, очистка хранилища и логирование
+        статуса выполняются ВСЕГДА, независимо от расписания записи. Расписание
+        ограничивает только создание новых фрагментов. Это критично для автономной
+        работы 24/7 с нестабильным интернетом: накопленные в pending/ файлы должны
+        выгружаться при любом появлении сети, даже вне окна записи. Раньше upload-
+        процессор запускался только внутри окна записи — backlog не выгружался до
+        следующего дня, что приводило к переполнению pending/.
+        """
         last_connectivity_check = 0
         last_queue_log = 0
         last_schedule_log = 0
@@ -921,40 +963,12 @@ class AudioRecorder:
             try:
                 current_time = time.time()
 
-                # --- Проверка расписания ---
-                if self.config.schedule.enabled:
-                    if self.in_recording_schedule():
-                        if not self.in_schedule_mode:
-                            logger.info(
-                                f"Начало записи по расписанию "
-                                f"({self.config.schedule.start_hour}:00–"
-                                f"{self.config.schedule.end_hour}:00)"
-                            )
-                            self.in_schedule_mode = True
-                    else:
-                        if self.in_schedule_mode or \
-                                (current_time - last_schedule_log > SCHEDULE_CHECK_INTERVAL_SECONDS):
-                            logger.info(
-                                f"Вне расписания записи "
-                                f"({self.config.schedule.start_hour}:00–"
-                                f"{self.config.schedule.end_hour}:00). Ожидание..."
-                            )
-                            self.in_schedule_mode = False
-                            last_schedule_log = current_time
-                        # shutdown_event.wait прерывается сигналом, в отличие от time.sleep
-                        if self.shutdown_event.wait(SCHEDULE_WAIT_SLEEP_SECONDS):
-                            break
-                        continue
-
                 # --- Периодический запуск обработчика очереди выгрузки ---
+                # Запускается всегда, даже вне расписания записи: интернет может
+                # появиться в любой момент, и backlog нужно выгружать.
                 if current_time - last_connectivity_check >= self.config.cloud.connectivity_check_interval:
                     last_connectivity_check = current_time
                     if not self.upload_thread or not self.upload_thread.is_alive():
-                        # SMELL-011: если upload_thread завис (жив, но не отвечает),
-                        # мы не можем его «убить» извне. Вместо этого логируем
-                        # предупреждение и НЕ перезапускаем — daemon-поток завершится
-                        # вместе с процессом. На практике зависание почти исключено,
-                        # т.к. все ожидания внутри upload_to_cloud прерываемые.
                         self.upload_thread = threading.Thread(
                             target=self.process_upload_queue,
                             name="QueueProcessor",
@@ -962,12 +976,39 @@ class AudioRecorder:
                         )
                         self.upload_thread.start()
 
+                # --- Очистка хранилища по лимиту ---
+                # Также выполняется всегда, чтобы pending/ не переполнился вне окна записи.
                 self._cleanup_storage(force=True)
 
                 # --- Логирование размера очереди ---
                 if current_time - last_queue_log >= QUEUE_LOG_INTERVAL_SECONDS:
                     self.log_queue_status()
                     last_queue_log = current_time
+
+                # --- Проверка расписания (ограничивает только запись) ---
+                if self.config.schedule.enabled and not self.in_recording_schedule():
+                    if self.in_schedule_mode or \
+                            (current_time - last_schedule_log > SCHEDULE_CHECK_INTERVAL_SECONDS):
+                        logger.info(
+                            f"Вне расписания записи "
+                            f"({self.config.schedule.start_hour}:00–"
+                            f"{self.config.schedule.end_hour}:00). "
+                            f"Очередь выгрузки продолжает работать. Ожидание..."
+                        )
+                        self.in_schedule_mode = False
+                        last_schedule_log = current_time
+                    # shutdown_event.wait прерывается сигналом, в отличие от time.sleep
+                    if self.shutdown_event.wait(SCHEDULE_WAIT_SLEEP_SECONDS):
+                        break
+                    continue
+
+                if self.config.schedule.enabled and not self.in_schedule_mode:
+                    logger.info(
+                        f"Начало записи по расписанию "
+                        f"({self.config.schedule.start_hour}:00–"
+                        f"{self.config.schedule.end_hour}:00)"
+                    )
+                    self.in_schedule_mode = True
 
                 # --- Проверка свободного места на диске ---
                 total_disk_space = disk_usage(self.config.output_dir)
@@ -982,9 +1023,6 @@ class AudioRecorder:
                         f"({total_disk_space.free / (1024 * 1024):.2f} MB свободно). "
                         f"Запись приостановлена."
                     )
-                    # Используем отдельную константу LOW_DISK_WAIT_SLEEP_SECONDS —
-                    # семантически это не «ожидание вне расписания», а пауза при
-                    # нехватке места (DEAD-002). Значения могут расходиться со временем.
                     if self.shutdown_event.wait(LOW_DISK_WAIT_SLEEP_SECONDS):
                         break
                     continue
@@ -1064,9 +1102,6 @@ class AudioRecorder:
         """Инициализирует окружение и запускает главные циклы."""
         signal.signal(signal.SIGINT, self.graceful_shutdown)
         signal.signal(signal.SIGTERM, self.graceful_shutdown)
-
-        # Безопасная очистка устаревшего lock (с проверкой PID), а не безусловное удаление
-        self._cleanup_stale_lock()
 
         os.makedirs(self._pending_dir, exist_ok=True)
 

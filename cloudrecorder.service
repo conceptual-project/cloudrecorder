@@ -1,14 +1,35 @@
 [Unit]
 Description=CloudRecorder - Audio Recorder with Cloud Upload
-After=network.target
+Documentation=file:///opt/cloudrecorder/readme.md
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+# НЕ запускаем от root — принцип наименьших привилегий. Пользователь должен быть
+# создан заранее (см. readme.md, раздел Installation) и входить в группу audio
+# для доступа к ALSA-устройствам микрофона.
+User=cloudrecorder
+Group=cloudrecorder
+SupplementaryGroups=audio
 WorkingDirectory=/opt/cloudrecorder
-ExecStart=/opt/cloudrecorder/cloudrecorder.bin /opt/cloudrecorder/config.json
-Restart=on-failure
+# По умолчанию используется интерпретатор Python. Если вы собрали Nuitka-бинарль
+# (cloudrecorder.bin), замените строку ExecStart на:
+#   ExecStart=/opt/cloudrecorder/cloudrecorder.bin /opt/cloudrecorder/config.json
+ExecStart=/usr/bin/python3 /opt/cloudrecorder/cloudrecorder.py /opt/cloudrecorder/config.json
+# Небуферизованный вывод — журналы в journald появляются в реальном времени.
+Environment=PYTHONUNBUFFERED=1
+# Restart=always — критично для автономной работы 24/7: сервис перезапускается
+# при любом выходе (включая чистый), не только при сбое. Защита от редких
+# edge-case-выходов с кодом 0.
+Restart=always
 RestartSec=10
+# Даём graceful shutdown до 30с (наш цикл завершения укладывается в ~20–30с).
+# После — systemd шлёт SIGKILL всей control-group (KillMode=control-group),
+# гарантированно убивая дочерние arecord/ffmpeg/rclone — без orphan-процессов.
+TimeoutStopSec=30
+KillMode=control-group
+KillSignal=SIGTERM
 StandardOutput=journal
 StandardError=journal
 
